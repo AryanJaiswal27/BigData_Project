@@ -1,0 +1,1090 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, hour, dayofweek, lag, to_timestamp
+from pyspark.sql.window import Window
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+import sys
+
+# -------------------------------
+# TEE LOGGER (Terminal + File)
+# -------------------------------
+class Tee:
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+log_file = open("full_output_log.txt", "w", encoding="utf-8")
+sys.stdout = Tee(sys.__stdout__, log_file)
+sys.stderr = Tee(sys.__stderr__, log_file)
+
+# -------------------------------
+# Pretty Print Box
+# -------------------------------
+def print_box(title):
+    print("\n" + "="*60)
+    print("[ " + title + " ]")
+    print("="*60)
+
+# -------------------------------
+# Start Spark (LOW MEMORY SAFE)
+# -------------------------------
+spark = SparkSession.builder \
+    .appName("Energy Prediction Model") \
+    .config("spark.driver.memory", "2g") \
+    .config("spark.sql.shuffle.partitions", "8") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
+
+# -------------------------------
+# STEP 1: Load Data
+# -------------------------------
+print_box("STEP 1: Loading Dataset")
+
+df = spark.read.csv("dataset/CC_LCL-FullData.csv", header=True, inferSchema=True)
+
+df = df.limit(200000)
+
+print("Loaded rows:", df.count())
+
+# -------------------------------
+# STEP 2: Cleaning
+# -------------------------------
+print_box("STEP 2: Cleaning")
+
+df = df.withColumn("KWH", col("KWH/hh (per half hour) ").cast("double"))
+df = df.withColumn("DateTime", to_timestamp("DateTime"))
+
+df = df.dropna()
+
+print("After cleaning rows:", df.count())
+
+# -------------------------------
+# STEP 3: Reduce Dataset
+# -------------------------------
+print_box("STEP 3: Reduce Dataset Size")
+
+df = df.filter(df.LCLid.isNotNull())
+df = df.limit(100000)
+
+print("Reduced rows:", df.count())
+
+# -------------------------------
+# STEP 4: Lag Features
+# -------------------------------
+print_box("STEP 4: Lag Features")
+
+windowSpec = Window.partitionBy("LCLid").orderBy("DateTime")
+
+df = df.withColumn("lag1", lag("KWH", 1).over(windowSpec))
+df = df.withColumn("lag2", lag("KWH", 2).over(windowSpec))
+
+# -------------------------------
+# STEP 5: Time Features
+# -------------------------------
+print_box("STEP 5: Time Features")
+
+df = df.withColumn("hour", hour("DateTime"))
+df = df.withColumn("day", dayofweek("DateTime"))
+
+# -------------------------------
+# STEP 6: Drop NULLs
+# -------------------------------
+print_box("STEP 6: Drop NULLs")
+
+df = df.dropna()
+
+print("Remaining rows:", df.count())
+
+# -------------------------------
+# STEP 7: Feature Vector
+# -------------------------------
+print_box("STEP 7: Feature Vector")
+
+assembler = VectorAssembler(
+    inputCols=["lag1", "lag2", "hour", "day"],
+    outputCol="features"
+)
+
+df = assembler.transform(df)
+
+df.select("features", "KWH").show(5, False)
+
+# -------------------------------
+# STEP 8: Train-Test Split
+# -------------------------------
+print_box("STEP 8: Train-Test Split")
+
+train = df.sample(0.7, seed=42)
+test = df.subtract(train)
+
+print("Train:", train.count())
+print("Test:", test.count())
+
+# -------------------------------
+# STEP 9: Training Model
+# -------------------------------
+print_box("STEP 9: Training Model")
+
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="KWH",
+    numTrees=3,
+    maxDepth=5
+)
+
+model = rf.fit(train)
+
+print("Model trained successfully")
+
+# -------------------------------
+# STEP 10: Predictions
+# -------------------------------
+print_box("STEP 10: Predictions")
+
+predictions = model.transform(test)
+
+predictions.select("DateTime", "KWH", "prediction").show(10)
+
+# -------------------------------
+# STEP 11: Evaluation
+# -------------------------------
+print_box("STEP 11: Evaluation")
+
+evaluator = RegressionEvaluator(
+    labelCol="KWH",
+    predictionCol="prediction",
+    metricName="rmse"
+)
+
+rmse = evaluator.evaluate(predictions)
+
+print("RMSE:", rmse)
+
+# -------------------------------
+# STEP 12: Saving Output
+# -------------------------------
+print_box("STEP 12: Saving Output")
+
+predictions.cache()
+predictions.count()
+
+predictions.select("DateTime", "KWH", "prediction") \
+    .coalesce(1) \
+    .write.mode("overwrite").csv("predictions_output")
+
+with open("model_report.txt", "w", encoding="utf-8") as f:
+    f.write("Model Evaluation Report\n")
+    f.write("=======================\n")
+    f.write(f"RMSE: {rmse}\n")
+
+print("Model report saved successfully!")
+
+# -------------------------------
+# DONE
+# -------------------------------
+print_box("PROCESS COMPLETED")
+
+log_file.close()
+spark.stop()
+
+# PS D:\BDA> spark-submit final.py
+# 26/03/30 01:16:56 INFO SparkContext: Running Spark version 3.5.8
+# 26/03/30 01:16:56 INFO SparkContext: OS info Windows 10, 10.0, amd64
+# 26/03/30 01:16:56 INFO SparkContext: Java version 1.8.0_202
+# 26/03/30 01:16:56 INFO ResourceUtils: ==============================================================
+# 26/03/30 01:16:56 INFO ResourceUtils: No custom resources configured for spark.driver.
+# 26/03/30 01:16:56 INFO ResourceUtils: ==============================================================
+# 26/03/30 01:16:56 INFO SparkContext: Submitted application: Energy Prediction Model
+# 26/03/30 01:16:56 INFO ResourceProfile: Default ResourceProfile created, executor resources: Map(cores -> name: cores, amount: 1, script: , vendor: , memory -> name: memory, amount: 1024, script: , vendor: , offHeap -> name: offHeap, amount: 0, script: , vendor: ), task resources: Map(cpus -> name: cpus, amount: 1.0)
+# 26/03/30 01:16:56 INFO ResourceProfile: Limiting resource is cpu
+# 26/03/30 01:16:56 INFO ResourceProfileManager: Added ResourceProfile id: 0
+# 26/03/30 01:16:56 INFO SecurityManager: Changing view acls to: Aryan
+# 26/03/30 01:16:56 INFO SecurityManager: Changing modify acls to: Aryan
+# 26/03/30 01:16:56 INFO SecurityManager: Changing view acls groups to:
+# 26/03/30 01:16:56 INFO SecurityManager: Changing modify acls groups to:
+# 26/03/30 01:16:56 INFO SecurityManager: SecurityManager: authentication disabled; ui acls disabled; users with view permissions: Aryan; groups with view permissions: EMPTY; users with modify permissions: Aryan; groups with modify permissions: EMPTY
+# 26/03/30 01:16:57 INFO Utils: Successfully started service 'sparkDriver' on port 64865.
+# 26/03/30 01:16:57 INFO SparkEnv: Registering MapOutputTracker
+# 26/03/30 01:16:57 INFO SparkEnv: Registering BlockManagerMaster
+# 26/03/30 01:16:57 INFO BlockManagerMasterEndpoint: Using org.apache.spark.storage.DefaultTopologyMapper for getting topology information
+# 26/03/30 01:16:57 INFO BlockManagerMasterEndpoint: BlockManagerMasterEndpoint up
+# 26/03/30 01:16:57 INFO SparkEnv: Registering BlockManagerMasterHeartbeat
+# 26/03/30 01:16:57 INFO DiskBlockManager: Created local directory at C:\Users\Aryan\AppData\Local\Temp\blockmgr-2864949d-6842-4589-ab98-b97fbf991ce3
+# 26/03/30 01:16:57 INFO MemoryStore: MemoryStore started with capacity 366.3 MiB
+# 26/03/30 01:16:57 INFO SparkEnv: Registering OutputCommitCoordinator
+# 26/03/30 01:16:58 INFO JettyUtils: Start Jetty 0.0.0.0:4040 for SparkUI
+# 26/03/30 01:16:58 INFO Utils: Successfully started service 'SparkUI' on port 4040.
+# 26/03/30 01:16:58 INFO Executor: Starting executor ID driver on host LAPTOP-G3EVCERA
+# 26/03/30 01:16:58 INFO Executor: OS info Windows 10, 10.0, amd64
+# 26/03/30 01:16:58 INFO Executor: Java version 1.8.0_202
+# 26/03/30 01:16:58 INFO Executor: Starting executor with user classpath (userClassPathFirst = false): ''
+# 26/03/30 01:16:58 INFO Executor: Created or updated repl class loader org.apache.spark.util.MutableURLClassLoader@dc514be for default.
+# 26/03/30 01:16:58 INFO Utils: Successfully started service 'org.apache.spark.network.netty.NettyBlockTransferService' on port 64912.
+# 26/03/30 01:16:58 INFO NettyBlockTransferService: Server created on LAPTOP-G3EVCERA:64912
+# 26/03/30 01:16:58 INFO BlockManager: Using org.apache.spark.storage.RandomBlockReplicationPolicy for block replication policy
+# 26/03/30 01:16:58 INFO BlockManagerMaster: Registering BlockManager BlockManagerId(driver, LAPTOP-G3EVCERA, 64912, None)
+# 26/03/30 01:16:58 INFO BlockManagerMasterEndpoint: Registering block manager LAPTOP-G3EVCERA:64912 with 366.3 MiB RAM, BlockManagerId(driver, LAPTOP-G3EVCERA, 64912, None)
+# 26/03/30 01:16:58 INFO BlockManagerMaster: Registered BlockManager BlockManagerId(driver, LAPTOP-G3EVCERA, 64912, None)
+# 26/03/30 01:16:58 INFO BlockManager: Initialized BlockManager: BlockManagerId(driver, LAPTOP-G3EVCERA, 64912, None)
+
+# ============================================================
+# [ STEP 1: Loading Dataset ]
+# ============================================================
+# Loaded rows: 200000
+
+# ============================================================
+# [ STEP 2: Cleaning ]
+# ============================================================
+# After cleaning rows: 199993
+
+# ============================================================
+# [ STEP 3: Reduce Dataset Size ]
+# ============================================================
+# Reduced rows: 100000
+
+# ============================================================
+# [ STEP 4: Lag Features ]
+# ============================================================
+
+# ============================================================
+# [ STEP 5: Time Features ]
+# ============================================================
+
+# ============================================================
+# [ STEP 6: Drop NULLs ]
+# ============================================================
+# Remaining rows: 99992
+
+# ============================================================
+# [ STEP 7: Feature Vector ]
+# ============================================================
+# +-----------------+---+
+# |features         |KWH|
+# +-----------------+---+
+# |[0.0,0.0,1.0,6.0]|0.0|
+# |[0.0,0.0,2.0,6.0]|0.0|
+# |[0.0,0.0,2.0,6.0]|0.0|
+# |[0.0,0.0,3.0,6.0]|0.0|
+# |[0.0,0.0,3.0,6.0]|0.0|
+# +-----------------+---+
+# only showing top 5 rows
+
+
+# ============================================================
+# [ STEP 8: Train-Test Split ]
+# ============================================================
+# Train: 69936
+# Test: 30053
+
+# ============================================================
+# [ STEP 9: Training Model ]
+# ============================================================
+# Model trained successfully
+
+# ============================================================
+# [ STEP 10: Predictions ]
+# ============================================================
+# +-------------------+-----+-------------------+
+# |           DateTime|  KWH|         prediction|
+# +-------------------+-----+-------------------+
+# |2012-10-12 02:30:00|  0.0|0.04519505699865731|
+# |2012-10-12 04:30:00|  0.0|0.04519505699865731|
+# |2012-10-12 05:30:00|  0.0|0.04519505699865731|
+# |2012-10-12 06:00:00|  0.0|0.04519505699865731|
+# |2012-10-12 08:00:00|  0.0|0.04519505699865731|
+# |2012-10-12 08:30:00|  0.0|0.04519505699865731|
+# |2012-10-12 09:00:00|  0.0|0.04519505699865731|
+# |2012-10-12 11:30:00|0.143|0.04519505699865731|
+# |2012-10-12 12:30:00|0.256|  0.227912783379524|
+# |2012-10-12 13:30:00|0.199|0.21027936263864966|
+# +-------------------+-----+-------------------+
+# only showing top 10 rows
+
+
+# ============================================================
+# [ STEP 11: Evaluation ]
+# ============================================================
+# RMSE: 0.22817852383006493
+
+# ============================================================
+# [ STEP 12: Saving Output ]
+# ============================================================
+# Model report saved successfully!
+
+# ============================================================
+# [ PROCESS COMPLETED ]
+# ============================================================
+# 26/03/30 01:20:23 ERROR DiskBlockManager: Exception while deleting local spark dir: C:\Users\Aryan\AppData\Local\Temp\blockmgr-2864949d-6842-4589-ab98-b97fbf991ce3
+# java.io.IOException: Failed to delete: C:\Users\Aryan\AppData\Local\Temp\blockmgr-2864949d-6842-4589-ab98-b97fbf991ce3\26\shuffle_16_731_0.data
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursivelyUsingJavaIO(JavaUtils.java:147)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:117)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursivelyUsingJavaIO(JavaUtils.java:130)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:117)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursivelyUsingJavaIO(JavaUtils.java:130)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:117)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:90)
+#         at org.apache.spark.util.SparkFileUtils.deleteRecursively(SparkFileUtils.scala:121)
+#         at org.apache.spark.util.SparkFileUtils.deleteRecursively$(SparkFileUtils.scala:120)
+#         at org.apache.spark.util.Utils$.deleteRecursively(Utils.scala:1126)
+#         at org.apache.spark.storage.DiskBlockManager.$anonfun$doStop$1(DiskBlockManager.scala:368)
+#         at org.apache.spark.storage.DiskBlockManager.$anonfun$doStop$1$adapted(DiskBlockManager.scala:364)
+#         at scala.collection.IndexedSeqOptimized.foreach(IndexedSeqOptimized.scala:36)
+#         at scala.collection.IndexedSeqOptimized.foreach$(IndexedSeqOptimized.scala:33)
+#         at scala.collection.mutable.ArrayOps$ofRef.foreach(ArrayOps.scala:198)
+#         at org.apache.spark.storage.DiskBlockManager.doStop(DiskBlockManager.scala:364)
+#         at org.apache.spark.storage.DiskBlockManager.stop(DiskBlockManager.scala:359)
+#         at org.apache.spark.storage.BlockManager.stop(BlockManager.scala:2122)
+#         at org.apache.spark.SparkEnv.stop(SparkEnv.scala:95)
+#         at org.apache.spark.SparkContext.$anonfun$stop$25(SparkContext.scala:2305)
+#         at org.apache.spark.util.Utils$.tryLogNonFatalError(Utils.scala:1375)
+#         at org.apache.spark.SparkContext.stop(SparkContext.scala:2305)
+#         at org.apache.spark.SparkContext.stop(SparkContext.scala:2211)
+#         at org.apache.spark.api.java.JavaSparkContext.stop(JavaSparkContext.scala:550)
+#         at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+#         at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+#         at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+#         at java.lang.reflect.Method.invoke(Method.java:498)
+#         at py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+#         at py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)
+#         at py4j.Gateway.invoke(Gateway.java:282)
+#         at py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+#         at py4j.commands.CallCommand.execute(CallCommand.java:79)
+#         at py4j.ClientServerConnection.waitForCommands(ClientServerConnection.java:182)
+#         at py4j.ClientServerConnection.run(ClientServerConnection.java:106)
+#         at java.lang.Thread.run(Thread.java:748)
+# Exception ignored in: Exception ignored in sys.unraisablehook
+
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, hour, dayofweek, lag, to_timestamp
+from pyspark.sql.window import Window
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+import sys
+
+# -------------------------------
+# TEE LOGGER (Terminal + File)
+# -------------------------------
+class Tee:
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+log_file = open("full_output_log.txt", "w", encoding="utf-8")
+sys.stdout = Tee(sys.__stdout__, log_file)
+sys.stderr = Tee(sys.__stderr__, log_file)
+
+# -------------------------------
+# Pretty Print Box
+# -------------------------------
+def print_box(title):
+    print("\n" + "="*60)
+    print("[ " + title + " ]")
+    print("="*60)
+
+# -------------------------------
+# Spark Session (slightly stronger)
+# -------------------------------
+spark = SparkSession.builder \
+    .appName("Energy Prediction Model - Improved") \
+    .config("spark.driver.memory", "3g") \
+    .config("spark.sql.shuffle.partitions", "12") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
+
+# -------------------------------
+# STEP 1: Load Data
+# -------------------------------
+print_box("STEP 1: Loading Dataset")
+
+df = spark.read.csv("dataset/CC_LCL-FullData.csv", header=True, inferSchema=True)
+
+# Use more data but still safe
+df = df.limit(300000)
+
+print("Loaded rows:", df.count())
+
+# -------------------------------
+# STEP 2: Cleaning
+# -------------------------------
+print_box("STEP 2: Cleaning")
+
+df = df.withColumn("KWH", col("KWH/hh (per half hour) ").cast("double"))
+df = df.withColumn("DateTime", to_timestamp("DateTime"))
+
+df = df.dropna()
+
+print("After cleaning rows:", df.count())
+
+# -------------------------------
+# STEP 3: Reduce (but smarter)
+# -------------------------------
+print_box("STEP 3: Reduce Dataset")
+
+df = df.filter(df.LCLid.isNotNull())
+
+# Keep more households than before
+df = df.limit(150000)
+
+print("Reduced rows:", df.count())
+
+# -------------------------------
+# STEP 4: Lag Features (IMPROVED)
+# -------------------------------
+print_box("STEP 4: Lag Features")
+
+windowSpec = Window.partitionBy("LCLid").orderBy("DateTime")
+
+df = df.withColumn("lag1", lag("KWH", 1).over(windowSpec))
+df = df.withColumn("lag2", lag("KWH", 2).over(windowSpec))
+df = df.withColumn("lag3", lag("KWH", 3).over(windowSpec))  # BACK
+
+# -------------------------------
+# STEP 5: Time Features
+# -------------------------------
+print_box("STEP 5: Time Features")
+
+df = df.withColumn("hour", hour("DateTime"))
+df = df.withColumn("day", dayofweek("DateTime"))
+
+# -------------------------------
+# STEP 6: Drop NULLs
+# -------------------------------
+print_box("STEP 6: Drop NULLs")
+
+df = df.dropna()
+
+print("Remaining rows:", df.count())
+
+# -------------------------------
+# STEP 7: Feature Vector
+# -------------------------------
+print_box("STEP 7: Feature Vector")
+
+assembler = VectorAssembler(
+    inputCols=["lag1", "lag2", "lag3", "hour", "day"],
+    outputCol="features"
+)
+
+df = assembler.transform(df)
+
+# Cache for performance
+df.cache()
+
+df.select("features", "KWH").show(5, False)
+
+# -------------------------------
+# STEP 8: Time-based Split (IMPORTANT)
+# -------------------------------
+print_box("STEP 8: Train-Test Split")
+
+train = df.filter(df.DateTime < "2014-01-01")
+test = df.filter(df.DateTime >= "2014-01-01")
+
+print("Train:", train.count())
+print("Test:", test.count())
+
+# -------------------------------
+# STEP 9: STRONG MODEL
+# -------------------------------
+print_box("STEP 9: Training Model")
+
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="KWH",
+    numTrees=15,     # ↑ more trees
+    maxDepth=10,     # ↑ deeper trees
+    maxBins=64       # better splits
+)
+
+model = rf.fit(train)
+
+print("Model trained successfully")
+
+# -------------------------------
+# STEP 10: Predictions
+# -------------------------------
+print_box("STEP 10: Predictions")
+
+predictions = model.transform(test)
+
+predictions.select("DateTime", "KWH", "prediction").show(10)
+
+# -------------------------------
+# STEP 11: Evaluation
+# -------------------------------
+print_box("STEP 11: Evaluation")
+
+evaluator = RegressionEvaluator(
+    labelCol="KWH",
+    predictionCol="prediction",
+    metricName="rmse"
+)
+
+rmse = evaluator.evaluate(predictions)
+
+print("RMSE:", rmse)
+
+# -------------------------------
+# STEP 12: Save Output
+# -------------------------------
+print_box("STEP 12: Saving Output")
+
+predictions.cache()
+predictions.count()
+
+predictions.select("DateTime", "KWH", "prediction") \
+    .coalesce(1) \
+    .write.mode("overwrite").csv("predictions_output")
+
+with open("model_report.txt", "w", encoding="utf-8") as f:
+    f.write("Improved Model Report\n")
+    f.write("=====================\n")
+    f.write(f"RMSE: {rmse}\n")
+
+print("Model report saved successfully!")
+
+# -------------------------------
+# DONE
+# -------------------------------
+print_box("PROCESS COMPLETED")
+
+log_file.close()
+spark.stop()
+
+
+
+# PS D:\BDA> spark-submit final.py
+# 26/03/30 01:24:14 INFO SparkContext: Running Spark version 3.5.8
+# 26/03/30 01:24:14 INFO SparkContext: OS info Windows 10, 10.0, amd64
+# 26/03/30 01:24:14 INFO SparkContext: Java version 1.8.0_202
+# 26/03/30 01:24:14 INFO ResourceUtils: ==============================================================
+# 26/03/30 01:24:14 INFO ResourceUtils: No custom resources configured for spark.driver.
+# 26/03/30 01:24:14 INFO ResourceUtils: ==============================================================
+# 26/03/30 01:24:14 INFO SparkContext: Submitted application: Energy Prediction Model - Improved
+# 26/03/30 01:24:14 INFO ResourceProfile: Default ResourceProfile created, executor resources: Map(cores -> name: cores, amount: 1, script: , vendor: , memory -> name: memory, amount: 1024, script: , vendor: , offHeap -> name: offHeap, amount: 0, script: , vendor: ), task resources: Map(cpus -> name: cpus, amount: 1.0)
+# 26/03/30 01:24:14 INFO ResourceProfile: Limiting resource is cpu
+# 26/03/30 01:24:14 INFO ResourceProfileManager: Added ResourceProfile id: 0
+# 26/03/30 01:24:14 INFO SecurityManager: Changing view acls to: Aryan
+# 26/03/30 01:24:14 INFO SecurityManager: Changing modify acls to: Aryan
+# 26/03/30 01:24:14 INFO SecurityManager: Changing view acls groups to:
+# 26/03/30 01:24:14 INFO SecurityManager: Changing modify acls groups to:
+# 26/03/30 01:24:14 INFO SecurityManager: SecurityManager: authentication disabled; ui acls disabled; users with view permissions: Aryan; groups with view permissions: EMPTY; users with modify permissions: Aryan; groups with modify permissions: EMPTY
+# 26/03/30 01:24:15 INFO Utils: Successfully started service 'sparkDriver' on port 55775.
+# 26/03/30 01:24:15 INFO SparkEnv: Registering MapOutputTracker
+# 26/03/30 01:24:15 INFO SparkEnv: Registering BlockManagerMaster
+# 26/03/30 01:24:15 INFO BlockManagerMasterEndpoint: Using org.apache.spark.storage.DefaultTopologyMapper for getting topology information
+# 26/03/30 01:24:15 INFO BlockManagerMasterEndpoint: BlockManagerMasterEndpoint up
+# 26/03/30 01:24:15 INFO SparkEnv: Registering BlockManagerMasterHeartbeat
+# 26/03/30 01:24:15 INFO DiskBlockManager: Created local directory at C:\Users\Aryan\AppData\Local\Temp\blockmgr-8acede88-7006-418d-874c-a004c10468c5
+# 26/03/30 01:24:15 INFO MemoryStore: MemoryStore started with capacity 366.3 MiB
+# 26/03/30 01:24:15 INFO SparkEnv: Registering OutputCommitCoordinator
+# 26/03/30 01:24:16 INFO JettyUtils: Start Jetty 0.0.0.0:4040 for SparkUI
+# 26/03/30 01:24:16 INFO Utils: Successfully started service 'SparkUI' on port 4040.
+# 26/03/30 01:24:16 INFO Executor: Starting executor ID driver on host LAPTOP-G3EVCERA
+# 26/03/30 01:24:16 INFO Executor: OS info Windows 10, 10.0, amd64
+# 26/03/30 01:24:16 INFO Executor: Java version 1.8.0_202
+# 26/03/30 01:24:16 INFO Executor: Starting executor with user classpath (userClassPathFirst = false): ''
+# 26/03/30 01:24:16 INFO Executor: Created or updated repl class loader org.apache.spark.util.MutableURLClassLoader@34980860 for default.
+# 26/03/30 01:24:16 INFO Utils: Successfully started service 'org.apache.spark.network.netty.NettyBlockTransferService' on port 55822.
+# 26/03/30 01:24:16 INFO NettyBlockTransferService: Server created on LAPTOP-G3EVCERA:55822
+# 26/03/30 01:24:16 INFO BlockManager: Using org.apache.spark.storage.RandomBlockReplicationPolicy for block replication policy
+# 26/03/30 01:24:16 INFO BlockManagerMaster: Registering BlockManager BlockManagerId(driver, LAPTOP-G3EVCERA, 55822, None)
+# 26/03/30 01:24:16 INFO BlockManagerMasterEndpoint: Registering block manager LAPTOP-G3EVCERA:55822 with 366.3 MiB RAM, BlockManagerId(driver, LAPTOP-G3EVCERA, 55822, None)
+# 26/03/30 01:24:16 INFO BlockManagerMaster: Registered BlockManager BlockManagerId(driver, LAPTOP-G3EVCERA, 55822, None)
+# 26/03/30 01:24:16 INFO BlockManager: Initialized BlockManager: BlockManagerId(driver, LAPTOP-G3EVCERA, 55822, None)
+
+# ============================================================
+# [ STEP 1: Loading Dataset ]
+# ============================================================
+# Loaded rows: 300000
+
+# ============================================================
+# [ STEP 2: Cleaning ]
+# ============================================================
+# After cleaning rows: 299989
+
+# ============================================================
+# [ STEP 3: Reduce Dataset ]
+# ============================================================
+# Reduced rows: 150000
+
+# ============================================================
+# [ STEP 4: Lag Features ]
+# ============================================================
+
+# ============================================================
+# [ STEP 5: Time Features ]
+# ============================================================
+
+# ============================================================
+# [ STEP 6: Drop NULLs ]
+# ============================================================
+# Remaining rows: 149985
+
+# ============================================================
+# [ STEP 7: Feature Vector ]
+# ============================================================
+# +-------------------+---+
+# |features           |KWH|
+# +-------------------+---+
+# |(5,[3,4],[2.0,6.0])|0.0|
+# |(5,[3,4],[2.0,6.0])|0.0|
+# |(5,[3,4],[3.0,6.0])|0.0|
+# |(5,[3,4],[3.0,6.0])|0.0|
+# |(5,[3,4],[4.0,6.0])|0.0|
+# +-------------------+---+
+# only showing top 5 rows
+
+
+# ============================================================
+# [ STEP 8: Train-Test Split ]
+# ============================================================
+# Train: 138838
+# Test: 11147
+
+# ============================================================
+# [ STEP 9: Training Model ]
+# ============================================================
+# Model trained successfully
+
+# ============================================================
+# [ STEP 10: Predictions ]
+# ============================================================
+# +-------------------+-----+-------------------+
+# |           DateTime|  KWH|         prediction|
+# +-------------------+-----+-------------------+
+# |2014-01-01 00:00:00|0.496| 0.3733698374234885|
+# |2014-01-01 00:30:00|0.427|0.38060294467046346|
+# |2014-01-01 01:00:00|0.469|0.28918932968019195|
+# |2014-01-01 01:30:00|0.362|0.28687911413507494|
+# |2014-01-01 02:00:00|0.452| 0.2671853959963374|
+# |2014-01-01 02:30:00|0.232|0.26985948229857853|
+# |2014-01-01 03:00:00|0.102|0.23496878796547574|
+# |2014-01-01 03:30:00|0.121|0.25209665458093566|
+# |2014-01-01 04:00:00|0.085|0.12618215105952318|
+# |2014-01-01 04:30:00|0.128| 0.1299714159951886|
+# +-------------------+-----+-------------------+
+# only showing top 10 rows
+
+
+# ============================================================
+# [ STEP 11: Evaluation ]
+# ============================================================
+# RMSE: 0.2040485439937137
+
+# ============================================================
+# [ STEP 12: Saving Output ]
+# ============================================================
+# Model report saved successfully!
+
+# ============================================================
+# [ PROCESS COMPLETED ]
+# ============================================================
+# Exception ignored in: Exception ignored in sys.unraisablehook
+# PS D:\BDA> 
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, hour, dayofweek, lag, to_timestamp, avg, when
+from pyspark.sql.window import Window
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+import sys
+
+# -------------------------------
+# Output to BOTH terminal + file
+# -------------------------------
+class Logger:
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        pass
+
+sys.stdout = Logger("full_output_log.txt")
+sys.stderr = sys.stdout
+
+# -------------------------------
+# Pretty Print
+# -------------------------------
+def print_box(title):
+    print("\n" + "="*60)
+    print("[ " + title + " ]")
+    print("="*60)
+
+# -------------------------------
+# Spark (optimized)
+# -------------------------------
+spark = SparkSession.builder \
+    .appName("Energy Prediction Model - Advanced") \
+    .config("spark.driver.memory", "2g") \
+    .config("spark.sql.shuffle.partitions", "8") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
+
+# -------------------------------
+# STEP 1: Load
+# -------------------------------
+print_box("STEP 1: Loading Dataset")
+
+df = spark.read.csv("dataset/CC_LCL-FullData.csv", header=True, inferSchema=True)
+df = df.limit(300000)
+
+print("Loaded rows:", df.count())
+
+# -------------------------------
+# STEP 2: Cleaning
+# -------------------------------
+print_box("STEP 2: Cleaning")
+
+df = df.withColumn("KWH", col("KWH/hh (per half hour) ").cast("double"))
+df = df.withColumn("DateTime", to_timestamp("DateTime"))
+df = df.dropna()
+
+print("After cleaning:", df.count())
+
+# -------------------------------
+# STEP 3: Reduce
+# -------------------------------
+print_box("STEP 3: Reduce Dataset")
+
+df = df.limit(150000)
+
+print("Reduced rows:", df.count())
+
+# -------------------------------
+# STEP 4: Lag Features (IMPROVED)
+# -------------------------------
+print_box("STEP 4: Lag Features")
+
+windowSpec = Window.partitionBy("LCLid").orderBy("DateTime")
+
+df = df.withColumn("lag1", lag("KWH", 1).over(windowSpec))
+df = df.withColumn("lag2", lag("KWH", 2).over(windowSpec))
+df = df.withColumn("lag3", lag("KWH", 3).over(windowSpec))
+df = df.withColumn("lag4", lag("KWH", 4).over(windowSpec))
+
+# -------------------------------
+# STEP 5: Time Features
+# -------------------------------
+print_box("STEP 5: Time Features")
+
+df = df.withColumn("hour", hour("DateTime"))
+df = df.withColumn("day", dayofweek("DateTime"))
+
+# Weekend feature (IMPORTANT)
+df = df.withColumn("is_weekend", when(col("day").isin([1,7]), 1).otherwise(0))
+
+# -------------------------------
+# STEP 6: Rolling Average (TREND)
+# -------------------------------
+print_box("STEP 6: Rolling Feature")
+
+rolling_window = Window.partitionBy("LCLid").orderBy("DateTime").rowsBetween(-3, 0)
+
+df = df.withColumn("rolling_avg", avg("KWH").over(rolling_window))
+
+# -------------------------------
+# STEP 7: Drop NULLs
+# -------------------------------
+print_box("STEP 7: Drop NULLs")
+
+df = df.dropna()
+
+print("Remaining rows:", df.count())
+
+# -------------------------------
+# STEP 8: Feature Vector
+# -------------------------------
+print_box("STEP 8: Features")
+
+assembler = VectorAssembler(
+    inputCols=[
+        "lag1", "lag2", "lag3", "lag4",
+        "hour", "day", "is_weekend",
+        "rolling_avg"
+    ],
+    outputCol="features"
+)
+
+df = assembler.transform(df)
+
+df.select("features", "KWH").show(5, False)
+
+# -------------------------------
+# STEP 9: Train-Test Split
+# -------------------------------
+print_box("STEP 9: Train-Test Split")
+
+train = df.sample(0.8, seed=42)
+test = df.subtract(train)
+
+print("Train:", train.count())
+print("Test:", test.count())
+
+# -------------------------------
+# STEP 10: Train Model (TUNED)
+# -------------------------------
+print_box("STEP 10: Training Model")
+
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="KWH",
+    numTrees=10,      # increased
+    maxDepth=10       # deeper trees
+)
+
+model = rf.fit(train)
+
+print("Model trained successfully")
+
+# -------------------------------
+# STEP 11: Predictions
+# -------------------------------
+print_box("STEP 11: Predictions")
+
+predictions = model.transform(test)
+
+predictions.select("DateTime", "KWH", "prediction").show(10)
+
+# -------------------------------
+# STEP 12: Evaluation
+# -------------------------------
+print_box("STEP 12: Evaluation")
+
+evaluator = RegressionEvaluator(
+    labelCol="KWH",
+    predictionCol="prediction",
+    metricName="rmse"
+)
+
+rmse = evaluator.evaluate(predictions)
+
+print("RMSE:", rmse)
+
+# -------------------------------
+# STEP 13: Save Output
+# -------------------------------
+print_box("STEP 13: Saving Output")
+
+predictions.cache()
+predictions.count()
+
+predictions.select("DateTime", "KWH", "prediction") \
+    .coalesce(1) \
+    .write.mode("overwrite").csv("predictions_output")
+
+with open("model_report.txt", "w", encoding="utf-8") as f:
+    f.write("Model Evaluation Report\n")
+    f.write("=======================\n")
+    f.write(f"RMSE: {rmse}\n")
+
+print("Model report saved successfully!")
+
+# -------------------------------
+# DONE
+# -------------------------------
+print_box("PROCESS COMPLETED")
+
+spark.stop()
+
+
+# PS D:\BDA> spark-submit final.py
+# 26/03/30 01:31:09 INFO SparkContext: Running Spark version 3.5.8
+# 26/03/30 01:31:09 INFO SparkContext: OS info Windows 10, 10.0, amd64
+# 26/03/30 01:31:09 INFO SparkContext: Java version 1.8.0_202
+# 26/03/30 01:31:10 INFO ResourceUtils: ==============================================================
+# 26/03/30 01:31:10 INFO ResourceUtils: No custom resources configured for spark.driver.
+# 26/03/30 01:31:10 INFO ResourceUtils: ==============================================================
+# 26/03/30 01:31:10 INFO SparkContext: Submitted application: Energy Prediction Model - Advanced
+# 26/03/30 01:31:10 INFO ResourceProfile: Default ResourceProfile created, executor resources: Map(cores -> name: cores, amount: 1, script: , vendor: , memory -> name: memory, amount: 1024, script: , vendor: , offHeap -> name: offHeap, amount: 0, script: , vendor: ), task resources: Map(cpus -> name: cpus, amount: 1.0)
+# 26/03/30 01:31:10 INFO ResourceProfile: Limiting resource is cpu
+# 26/03/30 01:31:10 INFO ResourceProfileManager: Added ResourceProfile id: 0
+# 26/03/30 01:31:10 INFO SecurityManager: Changing view acls to: Aryan
+# 26/03/30 01:31:10 INFO SecurityManager: Changing modify acls to: Aryan
+# 26/03/30 01:31:10 INFO SecurityManager: Changing view acls groups to:
+# 26/03/30 01:31:10 INFO SecurityManager: Changing modify acls groups to:
+# 26/03/30 01:31:10 INFO SecurityManager: SecurityManager: authentication disabled; ui acls disabled; users with view permissions: Aryan; groups with view permissions: EMPTY; users with modify permissions: Aryan; groups with modify permissions: EMPTY
+# 26/03/30 01:31:11 INFO Utils: Successfully started service 'sparkDriver' on port 62685.
+# 26/03/30 01:31:11 INFO SparkEnv: Registering MapOutputTracker
+# 26/03/30 01:31:11 INFO SparkEnv: Registering BlockManagerMaster
+# 26/03/30 01:31:11 INFO BlockManagerMasterEndpoint: Using org.apache.spark.storage.DefaultTopologyMapper for getting topology information
+# 26/03/30 01:31:11 INFO BlockManagerMasterEndpoint: BlockManagerMasterEndpoint up
+# 26/03/30 01:31:11 INFO SparkEnv: Registering BlockManagerMasterHeartbeat
+# 26/03/30 01:31:11 INFO DiskBlockManager: Created local directory at C:\Users\Aryan\AppData\Local\Temp\blockmgr-360b0b27-717b-415d-9835-747095c24164
+# 26/03/30 01:31:11 INFO MemoryStore: MemoryStore started with capacity 366.3 MiB
+# 26/03/30 01:31:11 INFO SparkEnv: Registering OutputCommitCoordinator
+# 26/03/30 01:31:11 INFO JettyUtils: Start Jetty 0.0.0.0:4040 for SparkUI
+# 26/03/30 01:31:11 INFO Utils: Successfully started service 'SparkUI' on port 4040.
+# 26/03/30 01:31:11 INFO Executor: Starting executor ID driver on host LAPTOP-G3EVCERA
+# 26/03/30 01:31:11 INFO Executor: OS info Windows 10, 10.0, amd64
+# 26/03/30 01:31:11 INFO Executor: Java version 1.8.0_202
+# 26/03/30 01:31:11 INFO Executor: Starting executor with user classpath (userClassPathFirst = false): ''
+# 26/03/30 01:31:11 INFO Executor: Created or updated repl class loader org.apache.spark.util.MutableURLClassLoader@58d26727 for default.
+# 26/03/30 01:31:12 INFO Utils: Successfully started service 'org.apache.spark.network.netty.NettyBlockTransferService' on port 62732.
+# 26/03/30 01:31:12 INFO NettyBlockTransferService: Server created on LAPTOP-G3EVCERA:62732
+# 26/03/30 01:31:12 INFO BlockManager: Using org.apache.spark.storage.RandomBlockReplicationPolicy for block replication policy
+# 26/03/30 01:31:12 INFO BlockManagerMaster: Registering BlockManager BlockManagerId(driver, LAPTOP-G3EVCERA, 62732, None)
+# 26/03/30 01:31:12 INFO BlockManagerMasterEndpoint: Registering block manager LAPTOP-G3EVCERA:62732 with 366.3 MiB RAM, BlockManagerId(driver, LAPTOP-G3EVCERA, 62732, None)
+# 26/03/30 01:31:12 INFO BlockManagerMaster: Registered BlockManager BlockManagerId(driver, LAPTOP-G3EVCERA, 62732, None)
+# 26/03/30 01:31:12 INFO BlockManager: Initialized BlockManager: BlockManagerId(driver, LAPTOP-G3EVCERA, 62732, None)
+
+# ============================================================
+# [ STEP 1: Loading Dataset ]
+# ============================================================
+# Loaded rows: 300000
+
+# ============================================================
+# [ STEP 2: Cleaning ]
+# ============================================================
+# After cleaning: 299989
+
+# ============================================================
+# [ STEP 3: Reduce Dataset ]
+# ============================================================
+# Reduced rows: 150000
+
+# ============================================================
+# [ STEP 4: Lag Features ]
+# ============================================================
+
+# ============================================================
+# [ STEP 5: Time Features ]
+# ============================================================
+
+# ============================================================
+# [ STEP 6: Rolling Feature ]
+# ============================================================
+
+# ============================================================
+# [ STEP 7: Drop NULLs ]
+# ============================================================
+# Remaining rows: 149980
+
+# ============================================================
+# [ STEP 8: Features ]
+# ============================================================
+# +-------------------+---+
+# |features           |KWH|
+# +-------------------+---+
+# |(8,[4,5],[2.0,6.0])|0.0|
+# |(8,[4,5],[3.0,6.0])|0.0|
+# |(8,[4,5],[3.0,6.0])|0.0|
+# |(8,[4,5],[4.0,6.0])|0.0|
+# |(8,[4,5],[4.0,6.0])|0.0|
+# +-------------------+---+
+# only showing top 5 rows
+
+
+# ============================================================
+# [ STEP 9: Train-Test Split ]
+# ============================================================
+# Train: 119845
+# Test: 30132
+
+# ============================================================
+# [ STEP 10: Training Model ]
+# ============================================================
+# Model trained successfully
+
+# ============================================================
+# [ STEP 11: Predictions ]
+# ============================================================
+# +-------------------+-----+--------------------+
+# |           DateTime|  KWH|          prediction|
+# +-------------------+-----+--------------------+
+# |2012-10-12 03:30:00|  0.0|0.007199082412684132|
+# |2012-10-12 05:30:00|  0.0|0.007199082412684132|
+# |2012-10-12 06:30:00|  0.0|0.007560780737935815|
+# |2012-10-12 09:00:00|  0.0|0.007423632159307613|
+# |2012-10-12 12:30:00|0.256|   0.366952565279808|
+# |2012-10-12 14:30:00|0.165|  0.1345534018631601|
+# |2012-10-12 17:30:00|0.354| 0.39689641609203014|
+# |2012-10-12 20:30:00|0.243| 0.28668500006462416|
+# |2012-10-13 01:30:00|0.256| 0.24884147097549195|
+# |2012-10-13 02:00:00|0.211| 0.24884147097549195|
+# +-------------------+-----+--------------------+
+# only showing top 10 rows
+
+
+# ============================================================
+# [ STEP 12: Evaluation ]
+# ============================================================
+# RMSE: 0.12719023583323197
+
+# ============================================================
+# [ STEP 13: Saving Output ]
+# ============================================================
+# Model report saved successfully!
+
+# ============================================================
+# [ PROCESS COMPLETED ]
+# ============================================================
+# 26/03/30 01:37:14 ERROR DiskBlockManager: Exception while deleting local spark dir: C:\Users\Aryan\AppData\Local\Temp\blockmgr-360b0b27-717b-415d-9835-747095c24164
+# java.io.IOException: Failed to delete: C:\Users\Aryan\AppData\Local\Temp\blockmgr-360b0b27-717b-415d-9835-747095c24164\30\shuffle_20_673_0.data
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursivelyUsingJavaIO(JavaUtils.java:147)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:117)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursivelyUsingJavaIO(JavaUtils.java:130)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:117)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursivelyUsingJavaIO(JavaUtils.java:130)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:117)
+#         at org.apache.spark.network.util.JavaUtils.deleteRecursively(JavaUtils.java:90)
+#         at org.apache.spark.util.SparkFileUtils.deleteRecursively(SparkFileUtils.scala:121)
+#         at org.apache.spark.util.SparkFileUtils.deleteRecursively$(SparkFileUtils.scala:120)
+#         at org.apache.spark.util.Utils$.deleteRecursively(Utils.scala:1126)
+#         at org.apache.spark.storage.DiskBlockManager.$anonfun$doStop$1(DiskBlockManager.scala:368)
+#         at org.apache.spark.storage.DiskBlockManager.$anonfun$doStop$1$adapted(DiskBlockManager.scala:364)
+#         at scala.collection.IndexedSeqOptimized.foreach(IndexedSeqOptimized.scala:36)
+#         at scala.collection.IndexedSeqOptimized.foreach$(IndexedSeqOptimized.scala:33)
+#         at scala.collection.mutable.ArrayOps$ofRef.foreach(ArrayOps.scala:198)
+#         at org.apache.spark.storage.DiskBlockManager.doStop(DiskBlockManager.scala:364)
+#         at org.apache.spark.storage.DiskBlockManager.stop(DiskBlockManager.scala:359)
+#         at org.apache.spark.storage.BlockManager.stop(BlockManager.scala:2122)
+#         at org.apache.spark.SparkEnv.stop(SparkEnv.scala:95)
+#         at org.apache.spark.SparkContext.$anonfun$stop$25(SparkContext.scala:2305)
+#         at org.apache.spark.util.Utils$.tryLogNonFatalError(Utils.scala:1375)
+#         at org.apache.spark.SparkContext.stop(SparkContext.scala:2305)
+#         at org.apache.spark.SparkContext.stop(SparkContext.scala:2211)
+#         at org.apache.spark.api.java.JavaSparkContext.stop(JavaSparkContext.scala:550)
+#         at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+#         at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+#         at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+#         at java.lang.reflect.Method.invoke(Method.java:498)
+#         at py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+#         at py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)
+#         at py4j.Gateway.invoke(Gateway.java:282)
+#         at py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+#         at py4j.commands.CallCommand.execute(CallCommand.java:79)
+#         at py4j.ClientServerConnection.waitForCommands(ClientServerConnection.java:182)
+#         at py4j.ClientServerConnection.run(ClientServerConnection.java:106)
+#         at java.lang.Thread.run(Thread.java:748)
+# PS D:\BDA> 
