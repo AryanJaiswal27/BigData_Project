@@ -1,3 +1,5 @@
+#Version1
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, hour, dayofweek, lag, to_timestamp
 from pyspark.sql.window import Window
@@ -364,7 +366,7 @@ spark.stop()
 #         at java.lang.Thread.run(Thread.java:748)
 # Exception ignored in: Exception ignored in sys.unraisablehook
 
-
+#Version2
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, hour, dayofweek, lag, to_timestamp
@@ -705,6 +707,8 @@ spark.stop()
 # Exception ignored in: Exception ignored in sys.unraisablehook
 # PS D:\BDA> 
 
+
+#Version3
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, hour, dayofweek, lag, to_timestamp, avg, when
